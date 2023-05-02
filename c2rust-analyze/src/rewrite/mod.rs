@@ -28,7 +28,9 @@ use rustc_middle::mir::Body;
 use rustc_middle::mir::Location;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
+use rustc_span::source_map::FileName;
 use std::fmt;
+use std::fs;
 
 mod apply;
 mod expr;
@@ -287,6 +289,16 @@ pub fn apply_rewrites(tcx: TyCtxt, rewrites: Vec<(Span, Rewrite)>) {
             }
         }
         eprintln!(" ===== END {:?} =====", filename);
+
+        let old_path = match filename {
+            FileName::Real(ref rfn) => rfn.local_path().unwrap(),
+            _ => {
+                eprintln!("can't rewrite non-real file {:?}", filename);
+                continue;
+            },
+        };
+        let new_path = old_path.with_extension("new.rs");
+        fs::write(new_path, src).unwrap();
     }
 }
 
