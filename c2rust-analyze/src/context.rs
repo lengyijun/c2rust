@@ -8,6 +8,7 @@ use crate::pointer_id::{
 use crate::util::{self, describe_rvalue, PhantomLifetime, RvalueDesc};
 use crate::AssignPointerIds;
 use bitflags::bitflags;
+use log::*;
 use rustc_hir::def_id::DefId;
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir::interpret::{self, AllocId, ConstValue, GlobalAlloc};
@@ -177,6 +178,7 @@ pub struct GlobalAnalysisCtxt<'tcx> {
     pub field_tys: HashMap<DefId, LTy<'tcx>>,
 
     pub static_tys: HashMap<DefId, LTy<'tcx>>,
+    pub addr_of_static: HashMap<DefId, PointerId>,
 }
 
 pub struct AnalysisCtxt<'a, 'tcx> {
@@ -186,8 +188,8 @@ pub struct AnalysisCtxt<'a, 'tcx> {
 
     pub local_decls: &'a LocalDecls<'tcx>,
     pub local_tys: IndexVec<Local, LTy<'tcx>>,
-    pub c_void_casts: CVoidCasts<'tcx>,
     pub addr_of_local: IndexVec<Local, PointerId>,
+    pub c_void_casts: CVoidCasts<'tcx>,
     /// Types for certain [`Rvalue`]s.  Some `Rvalue`s introduce fresh [`PointerId`]s; to keep
     /// those `PointerId`s consistent, the `Rvalue`'s type must be stored rather than recomputed on
     /// the fly.
@@ -244,6 +246,7 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             fns_failed: HashMap::new(),
             field_tys: HashMap::new(),
             static_tys: HashMap::new(),
+            addr_of_static: HashMap::new(),
         }
     }
 
@@ -290,6 +293,7 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
             fns_failed: _,
             ref mut field_tys,
             ref mut static_tys,
+            ref mut addr_of_static,
         } = *self;
 
         *ptr_info = remap_global_ptr_info(ptr_info, map, counter.num_pointers());
@@ -311,11 +315,20 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         for labeled_static in static_tys.values_mut() {
             *labeled_static = remap_lty_pointers(lcx, map, labeled_static);
         }
+
+        for ptr in addr_of_static.values_mut() {
+            if !ptr.is_none() {
+                *ptr = map[*ptr];
+            }
+        }
     }
 
     pub fn assign_pointer_to_static(&mut self, did: DefId) {
-        let lty = self.assign_pointer_ids(self.tcx.static_ptr_ty(did));
+        trace!("assign_pointer_to_static({:?})", did);
+        let lty = self.assign_pointer_ids(self.tcx.type_of(did));
+        let ptr = self.new_pointer(PointerInfo::empty());
         self.static_tys.insert(did, lty);
+        self.addr_of_static.insert(did, ptr);
     }
 
     pub fn assign_pointer_to_field(&mut self, field: &FieldDef) {
@@ -693,10 +706,15 @@ impl<'tcx> TypeOf<'tcx> for Operand<'tcx> {
                 if c.ty().is_any_ptr() {
                     if let Some(alloc_id) = const_alloc_id(c) {
                         if let Some(did) = find_static_for_alloc(&acx.gacx.tcx, alloc_id) {
-                            match acx.gacx.static_tys.get(&did) {
-                                Some(lty) => lty,
-                                None => panic!("did {:?} not found", did),
-                            }
+                            let lty = acx.gacx.static_tys.get(&did).cloned()
+                                .unwrap_or_else(|| panic!("did {:?} not found", did));
+                            let ptr = acx.gacx.addr_of_static.get(&did).cloned()
+                                .unwrap_or_else(|| panic!("did {:?} not found", did));
+                            let args = acx.lcx().mk_slice(&[lty]);
+                            assert!(
+                                matches!(*c.ty().kind(), TyKind::Ref(..) | TyKind::RawPtr(..)),
+                            );
+                            acx.lcx().mk(c.ty(), args, ptr)
                         } else {
                             panic!("no static found for alloc id {:?}", alloc_id)
                         }
