@@ -150,9 +150,21 @@ pub struct LFnSig<'tcx> {
     pub output: LTy<'tcx>,
 }
 
+bitflags! {
+    /// Additional flags describing a given pointer type.  These are mainly derived from
+    /// `PermissionSet`, but don't follow the normal subtyping rules and propagation algorithm.
+    #[derive(Default)]
+    pub struct PointerInfo: u16 {
+        /// This `PointerId` was generated for a `TyKind::Ref`.
+        const REF = 0x0001;
+    }
+}
+
 pub struct GlobalAnalysisCtxt<'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub lcx: LTyCtxt<'tcx>,
+
+    ptr_info: GlobalPointerTable<PointerInfo>,
 
     /// Map from a function to all of its callers.
     pub fn_callers: HashMap<DefId, Vec<DefId>>,
@@ -165,12 +177,12 @@ pub struct GlobalAnalysisCtxt<'tcx> {
     pub field_tys: HashMap<DefId, LTy<'tcx>>,
 
     pub static_tys: HashMap<DefId, LTy<'tcx>>,
-
-    next_ptr_id: NextGlobalPointerId,
 }
 
 pub struct AnalysisCtxt<'a, 'tcx> {
     pub gacx: &'a mut GlobalAnalysisCtxt<'tcx>,
+
+    ptr_info: LocalPointerTable<PointerInfo>,
 
     pub local_decls: &'a LocalDecls<'tcx>,
     pub local_tys: IndexVec<Local, LTy<'tcx>>,
@@ -183,8 +195,6 @@ pub struct AnalysisCtxt<'a, 'tcx> {
 
     /// [`Location`]s of (byte-)string literal [`rvalue_tys`](Self::rvalue_tys).
     pub string_literal_locs: Vec<Location>,
-
-    next_ptr_id: NextLocalPointerId,
 }
 
 impl<'a, 'tcx> AnalysisCtxt<'_, 'tcx> {
@@ -216,11 +226,11 @@ impl<'a, 'tcx> AnalysisCtxt<'_, 'tcx> {
 }
 
 pub struct AnalysisCtxtData<'tcx> {
+    ptr_info: LocalPointerTable<PointerInfo>,
     local_tys: IndexVec<Local, LTy<'tcx>>,
     addr_of_local: IndexVec<Local, PointerId>,
     rvalue_tys: HashMap<Location, LTy<'tcx>>,
     string_literal_locs: Vec<Location>,
-    next_ptr_id: NextLocalPointerId,
 }
 
 impl<'tcx> GlobalAnalysisCtxt<'tcx> {
@@ -228,12 +238,12 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         GlobalAnalysisCtxt {
             tcx,
             lcx: LabeledTyCtxt::new(tcx),
+            ptr_info: GlobalPointerTable::empty(),
             fn_callers: HashMap::new(),
             fn_sigs: HashMap::new(),
             fns_failed: HashMap::new(),
             field_tys: HashMap::new(),
             static_tys: HashMap::new(),
-            next_ptr_id: NextGlobalPointerId::new(),
         }
     }
 
@@ -249,12 +259,18 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         AnalysisCtxt::from_data(self, mir, data)
     }
 
-    pub fn new_pointer(&mut self) -> PointerId {
-        self.next_ptr_id.next()
+    pub fn new_pointer(&mut self, info: PointerInfo) -> PointerId {
+        let i = self.ptr_info.len();
+        self.ptr_info.push(info);
+        PointerId::global(u32::try_from(i).unwrap())
     }
 
     pub fn num_pointers(&self) -> usize {
-        self.next_ptr_id.num_pointers()
+        self.ptr_info.len()
+    }
+
+    pub fn ptr_info(&self) -> &GlobalPointerTable<PointerInfo> {
+        &self.ptr_info
     }
 
     /// Update all [`PointerId`]s in `self`, replacing each `p` with `map[p]`.  Also sets the "next
@@ -268,13 +284,15 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         let GlobalAnalysisCtxt {
             tcx: _,
             lcx,
+            ref mut ptr_info,
             fn_callers: _,
             ref mut fn_sigs,
             fns_failed: _,
             ref mut field_tys,
             ref mut static_tys,
-            ref mut next_ptr_id,
         } = *self;
+
+        *ptr_info = remap_global_ptr_info(ptr_info, map, counter.num_pointers());
 
         for sig in fn_sigs.values_mut() {
             sig.inputs = lcx.mk_slice(
@@ -293,8 +311,6 @@ impl<'tcx> GlobalAnalysisCtxt<'tcx> {
         for labeled_static in static_tys.values_mut() {
             *labeled_static = remap_lty_pointers(lcx, map, labeled_static);
         }
-
-        *next_ptr_id = counter;
     }
 
     pub fn assign_pointer_to_static(&mut self, did: DefId) {
@@ -343,13 +359,13 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
         let tcx = gacx.tcx;
         AnalysisCtxt {
             gacx,
+            ptr_info: LocalPointerTable::empty(),
             local_decls: &mir.local_decls,
             local_tys: IndexVec::new(),
             c_void_casts: CVoidCasts::new(mir, tcx),
             addr_of_local: IndexVec::new(),
             rvalue_tys: HashMap::new(),
             string_literal_locs: Default::default(),
-            next_ptr_id: NextLocalPointerId::new(),
         }
     }
 
@@ -359,31 +375,31 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
         data: AnalysisCtxtData<'tcx>,
     ) -> AnalysisCtxt<'a, 'tcx> {
         let AnalysisCtxtData {
+            ptr_info,
             local_tys,
             addr_of_local,
             rvalue_tys,
             string_literal_locs,
-            next_ptr_id,
         } = data;
         AnalysisCtxt {
             gacx,
+            ptr_info,
             local_decls: &mir.local_decls,
             local_tys,
             c_void_casts: CVoidCasts::default(),
             addr_of_local,
             rvalue_tys,
             string_literal_locs,
-            next_ptr_id,
         }
     }
 
     pub fn into_data(self) -> AnalysisCtxtData<'tcx> {
         AnalysisCtxtData {
+            ptr_info: self.ptr_info,
             local_tys: self.local_tys,
             addr_of_local: self.addr_of_local,
             rvalue_tys: self.rvalue_tys,
             string_literal_locs: self.string_literal_locs,
-            next_ptr_id: self.next_ptr_id,
         }
     }
 
@@ -395,12 +411,16 @@ impl<'a, 'tcx> AnalysisCtxt<'a, 'tcx> {
         self.gacx.lcx
     }
 
-    pub fn new_pointer(&mut self) -> PointerId {
-        self.next_ptr_id.next()
+    pub fn new_pointer(&mut self, info: PointerInfo) -> PointerId {
+        self.ptr_info.push(info)
     }
 
     pub fn num_pointers(&self) -> usize {
-        self.next_ptr_id.num_pointers()
+        self.ptr_info.len()
+    }
+
+    pub fn ptr_info(&self) -> PointerTable<PointerInfo> {
+        self.gacx.ptr_info.and(&self.ptr_info)
     }
 
     pub fn type_of<T: TypeOf<'tcx>>(&self, x: T) -> LTy<'tcx> {
@@ -515,17 +535,22 @@ impl<'tcx> AnalysisCtxtData<'tcx> {
     /// [`LocalEquivSet::renumber`][crate::equiv::LocalEquivSet::renumber].
     pub fn remap_pointers(
         &mut self,
-        lcx: LTyCtxt<'tcx>,
+        gacx: &mut GlobalAnalysisCtxt<'tcx>,
         map: PointerTable<PointerId>,
         counter: NextLocalPointerId,
     ) {
+        let lcx = gacx.lcx;
+
         let Self {
+            ptr_info,
             local_tys,
             addr_of_local,
             rvalue_tys,
             string_literal_locs: _,
-            next_ptr_id,
         } = self;
+
+        *ptr_info =
+            remap_local_ptr_info(ptr_info, &mut gacx.ptr_info, &map, counter.num_pointers());
 
         for lty in local_tys {
             *lty = remap_lty_pointers(lcx, &map, lty);
@@ -540,12 +565,10 @@ impl<'tcx> AnalysisCtxtData<'tcx> {
         for lty in rvalue_tys.values_mut() {
             *lty = remap_lty_pointers(lcx, &map, lty);
         }
-
-        *next_ptr_id = counter;
     }
 
     pub fn num_pointers(&self) -> usize {
-        self.next_ptr_id.num_pointers()
+        self.ptr_info.len()
     }
 }
 
@@ -562,6 +585,43 @@ where
             map[inner_lty.label]
         }
     })
+}
+
+/// Renumber the keys of `ptr_info`, producing a new table.  For a new `PointerId` `q`, the
+/// `PointerInfo` in the output is computed by merging the values of `ptr_info[p]` for all `p`
+/// where `map[p] == q`.
+fn remap_global_ptr_info(
+    ptr_info: &GlobalPointerTable<PointerInfo>,
+    map: &GlobalPointerTable<PointerId>,
+    num_pointers: usize,
+) -> GlobalPointerTable<PointerInfo> {
+    let mut new_info = GlobalPointerTable::<PointerInfo>::new(num_pointers);
+    for (old, &new) in map.iter() {
+        new_info[new] |= ptr_info[old];
+    }
+    new_info
+}
+
+/// Renumber the keys of `old_local_ptr_info`, producing a new local table.  `new_global_ptr_info`
+/// must already be remapped with `remap_global_ptr_info`.
+fn remap_local_ptr_info(
+    old_local_ptr_info: &LocalPointerTable<PointerInfo>,
+    new_global_ptr_info: &mut GlobalPointerTable<PointerInfo>,
+    map: &PointerTable<PointerId>,
+    num_pointers: usize,
+) -> LocalPointerTable<PointerInfo> {
+    let mut new_local_ptr_info = LocalPointerTable::<PointerInfo>::new(num_pointers);
+    let mut new_ptr_info = new_global_ptr_info.and_mut(&mut new_local_ptr_info);
+    for (old, &new) in map.iter() {
+        if old.is_global() {
+            // If `old` is global then `new` is also global, and this remapping was handled already
+            // by `remap_global_ptr_info`.
+            continue;
+        }
+
+        new_ptr_info[new] |= old_local_ptr_info[old];
+    }
+    new_local_ptr_info
 }
 
 impl<'tcx> HasLocalDecls<'tcx> for AnalysisCtxt<'_, 'tcx> {
