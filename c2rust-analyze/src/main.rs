@@ -37,7 +37,7 @@ use rustc_middle::mir::{
     AggregateKind, BindingForm, Body, Constant, LocalDecl, LocalInfo, LocalKind, Location, Operand,
     Rvalue, StatementKind,
 };
-use rustc_middle::ty::tls;
+use rustc_middle::ty::{tls, GenericParamDefKind};
 use rustc_middle::ty::{GenericArgKind, Ty, TyCtxt, TyKind, WithOptConstParam};
 use rustc_span::Span;
 use rustc_type_ir::RegionKind::{ReEarlyBound, ReStatic};
@@ -335,12 +335,20 @@ impl<'tcx> Debug for AdtMetadataTable<'tcx> {
             let tcx = tcx.unwrap();
             for k in &self.struct_dids {
                 let adt = &self.table[k];
+                let other_param_names = tcx.generics_of(k).params.iter().filter_map(|p| {
+                    if !matches!(p.kind, GenericParamDefKind::Lifetime) {
+                        Some(p.name.to_ident_string())
+                    } else {
+                        None
+                    }
+                });
                 write!(f, "struct {:}", tcx.item_name(*k))?;
                 write!(f, "<")?;
                 let lifetime_params_str = adt
                     .lifetime_params
                     .iter()
                     .map(|p| format!("{:?}", p))
+                    .chain(other_param_names)
                     .collect::<Vec<_>>()
                     .join(",");
                 write!(f, "{lifetime_params_str:}")?;
@@ -726,12 +734,12 @@ fn run(tcx: TyCtxt) {
         }
 
         eprintln!("\ntype assignment for {:?}:", name);
-        rewrite::dump_rewritten_local_tys(&acx, &asn, &mir, describe_local);
+        rewrite::dump_rewritten_local_tys(&acx, &asn, &mir, describe_local, &adt_metadata);
 
         eprintln!();
         let hir_body_id = tcx.hir().body_owned_by(ldid);
         let expr_rewrites = rewrite::gen_expr_rewrites(&acx, &asn, &mir, hir_body_id);
-        let ty_rewrites = rewrite::gen_ty_rewrites(&acx, &asn, &mir, ldid);
+        let ty_rewrites = rewrite::gen_ty_rewrites(&acx, &asn, &mir, ldid, &adt_metadata);
         // Print rewrites
         eprintln!(
             "\ngenerated {} expr rewrites + {} ty rewrites for {:?}:",
